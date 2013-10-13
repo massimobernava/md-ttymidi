@@ -45,6 +45,9 @@ int run;
 int serial;
 int port_out_id;
 
+char cmd[] = {0xF0, 0x77, 0x00, 0x00, 0x00, 0x00, 0xFF};
+int Mode=0;
+
 /* --------------------------------------------------------------------- */
 // Program options
 
@@ -56,12 +59,13 @@ static struct argp_option options[] =
 	{"printonly"    , 'p', 0     , 0, "Super debugging: Print values read from serial -- and do nothing else" },
 	{"quiet"        , 'q', 0     , 0, "Don't produce any output, even when the print command is sent" },
 	{"name"		, 'n', "NAME", 0, "Name of the Alsa MIDI client. Default = ttymidi" },
+	{"control"		, 'c', 0, 0, "microDrum Control Menu" },//mD
 	{ 0 }
 };
 
 typedef struct _arguments
 {
-	int  silent, verbose, printonly;
+	int  silent, verbose, printonly,control;//mD
 	char serialdevice[MAX_DEV_STR_LEN];
 	int  baudrate;
 	char name[MAX_DEV_STR_LEN];
@@ -99,6 +103,11 @@ static error_t parse_opt (int key, char *arg, struct argp_state *state)
 			if (arg == NULL) break;
 			strncpy(arguments->name, arg, MAX_DEV_STR_LEN);
 			break;
+			
+		case 'c'://mD
+			arguments->control=1;
+			arguments->silent=1;
+			break;
 		case 'b':
 			if (arg == NULL) break;
 			baud_temp = strtol(arg, NULL, 0);
@@ -133,6 +142,7 @@ void arg_set_defaults(arguments_t *arguments)
 	arguments->printonly    = 0;
 	arguments->silent       = 0;
 	arguments->verbose      = 0;
+	arguments->control		= 0;
 	arguments->baudrate     = B115200;
 	char *name_tmp		= (char *)"ttymidi";
 	strncpy(arguments->serialdevice, serialdevice_temp, MAX_DEV_STR_LEN);
@@ -207,6 +217,13 @@ void parse_midi_command(snd_seq_t* seq, int port_out_id, char *buf)
 	   buf[1] --> param1
 	   buf[2] --> param2        (param2 not transmitted on program change or key press)
    */
+	/*
+		MICRODRUM SIMPLESYSEX MESSAGE
+		-------------------------------------------------------------------
+		 Byte   [0]    [1]    [2]    [3]   [4]   [5]    [6]
+		       0xF0   0x77    CMD  Data1 Data2 Data3   0xF7
+		
+	*/
 
 	snd_seq_event_t ev;
 	snd_seq_ev_clear(&ev);
@@ -266,7 +283,24 @@ void parse_midi_command(snd_seq_t* seq, int port_out_id, char *buf)
 			snd_seq_ev_set_pitchbend(&ev, channel, param1 - 8192); // in alsa MIDI we want signed int
 			break;
 
-		/* Not implementing system commands (0xF0) */
+		case 0xF0: //mD
+			if(channel!=0x00) break;
+			snd_seq_ev_set_sysex(&ev,7,buf);
+			
+			if(buf[2]==0x60)//License
+			{
+				if (!arguments.silent && arguments.verbose) 
+					printf("Serial  0x%x Sysex           License 0x%x 0x%x 0x%x\n", buf[0],  buf[3], buf[4], buf[5]);
+					
+				write(serial,buf,7);
+			}
+			else if(arguments.control)
+			{
+				if(buf[2]==0x01 || buf[2]==0x00) Mode=buf[3];
+			}
+			else if (!arguments.silent && arguments.verbose) 
+				printf("Serial  0x%x Sysex           0x%x 0x%x 0x%x 0x%x\n", buf[0],  buf[2], buf[3], buf[4], buf[5]);
+			break;
 			
 		default:
 			if (!arguments.silent) 
@@ -345,6 +379,17 @@ void write_midi_action_to_serial_port(snd_seq_t* seq_handle)
 					printf("Alsa    0x%x Pitch bend         %03u %5d\n", bytes[0]&0xF0, bytes[0]&0xF, ev->data.control.value);
 				break;
 
+			case SND_SEQ_EVENT_SYSEX://mD
+				bytes[0]=0x00;
+				char sysex[] = {0xF0, 0x77, 0x00, 0x00, 0x00, 0x00, 0xF7};
+				sysex[2]=((char*)ev->data.ext.ptr)[2];
+				sysex[3]=((char*)ev->data.ext.ptr)[3];
+				sysex[4]=((char*)ev->data.ext.ptr)[4];
+				sysex[5]=((char*)ev->data.ext.ptr)[5];
+				write(serial, sysex, 7);
+				//if (!arguments.silent && arguments.verbose) 
+				//	printf("Alsa    0x%x Pitch bend         %03u %5d\n", bytes[0]&0xF0, bytes[0]&0xF, ev->data.control.value);
+				break;
 			default:
 				break;
 		}
@@ -391,7 +436,9 @@ void* read_midi_from_alsa(void* seq)
 
 void* read_midi_from_serial_port(void* seq) 
 {
-	char buf[3], msg[MAX_MSG_SIZE];
+	
+	char buf[7]; //mD
+	char msg[MAX_MSG_SIZE];
 	int i, msglen;
 	
 	/* Lets first fast forward to first status byte... */
@@ -421,6 +468,7 @@ void* read_midi_from_serial_port(void* seq)
 
 		int i = 1;
 
+
 		while (i < 3) {
 			read(serial, buf+i, 1);
 
@@ -438,7 +486,16 @@ void* read_midi_from_serial_port(void* seq)
 					/* Lets figure out are we done or should we read one more byte. */
 					if ((buf[0] & 0xF0) == 0xC0 || (buf[0] & 0xF0) == 0xD0) {
 						i = 3;
-					} else {
+					} 
+					else if(buf[0]==0xF0 ) //mD
+					{
+						i=2;
+						while (i < 7) {
+							read(serial, buf+i, 1);
+							i++;
+						}
+					}
+					else {
 						i = 2;
 					}
 				}
@@ -471,6 +528,15 @@ void* read_midi_from_serial_port(void* seq)
 	}
 }
 
+void printHeader()
+{
+	printf("\033[2J\033[1;1H");
+	printf("=========================\n");
+	printf("microDrum Control v0.1\n");
+	printf("Mode = %i\n",Mode);
+	printf("=========================\n\n");
+
+}
 /* --------------------------------------------------------------------- */
 // Main program
 
@@ -575,9 +641,50 @@ main(int argc, char** argv)
 	signal(SIGINT, exit_cli);
 	signal(SIGTERM, exit_cli);
 
+	char c;
+	
+	if(!arguments.control) while (run) sleep(100);
+	else
 	while (run)
 	{   
-		sleep(100);
+		if(c=='e') { sleep(100); continue; }
+		
+		printHeader();
+		printf("1 - Change Mode\n");
+		printf("e - Exit to verbose mode\n");
+		printf("Select:");
+		c=getchar();
+		getchar();
+		
+		switch(c)
+		{
+			case '1':
+				printHeader();
+				printf("1 - Setup Mode\n");
+				printf("2 - Monitor Mode\n");
+				printf("Select:");
+				c=getchar();
+				getchar();
+				switch(c)
+				{
+					case '1':
+						cmd[2]=0x01;
+						cmd[3]=0x01;
+						write(serial,cmd,7);
+					break;
+					case '2':
+						cmd[2]=0x01;
+						cmd[3]=0x02;
+						write(serial,cmd,7);
+					break;
+				}
+			break;
+			case 'e':
+				arguments.silent=0;
+				arguments.verbose=1;
+			break;
+		}
+		
 	}
 
 	void* status;
